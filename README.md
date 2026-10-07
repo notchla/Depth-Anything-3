@@ -216,6 +216,7 @@ Each script takes `--help`. Things to keep in mind:
 - The image size is static (`--size H W`, multiples of 14; 280×504 is what `process_res=504` gives for 16:9 images), so you need one engine per size. The number of views is dynamic, 1 to 32 by default with kernels tuned for 16 (`--max-views` at export, `--views min opt max` at build).
 - Poses are a separate engine (`--with-poses`), as TensorRT has no optional inputs.
 - The precision (`fp16` by default, `bf16`, `fp32`) is chosen at ONNX export, since TensorRT 11 builds strongly typed networks. Inputs and outputs are FP32 regardless.
+- The DPT head runs at that precision too, whereas PyTorch runs it in FP32: about 10% faster at 16 views for slightly larger depth errors. `--no-half-head` (at export and in `verify_trt.py`) keeps it in FP32 and names the files `*_fp32head`.
 - Image preprocessing, extrinsics normalization and the alignment of predictions to input poses stay in Python: use `InputProcessor`, `DepthAnything3._normalize_extrinsics` and `DepthAnything3._align_to_input_extrinsics_intrinsics` as `DepthAnything3.inference` does.
 - Without poses, the reference-view strategy is baked into the engine (`--ref-view-strategy`, `saddle_balanced` by default), and the engine returns the view it chose as `reference_view`. With many views, `saddle_balanced` can rank views by score differences within floating-point rounding, so TensorRT and PyTorch may pick different reference views; `verify_trt.py` then compares with PyTorch forced to the TensorRT choice. Use `--ref-view-strategy first` for reproducible poses.
 
@@ -245,11 +246,11 @@ engine = TRTEngine(Path("exports/da3-giant-1.1_saddle_balanced_280x504_fp16.engi
 out = engine(image=images[None].cuda())  # depth, depth_conf, extrinsics, intrinsics, reference_view
 ```
 
-With FP16 engines of `DA3-GIANT-1.1` at 280×504 on an RTX 5090, mean relative depth error against PyTorch at the same precision is below 0.1% and pose rotation error below 0.05°. The engine skips the auxiliary ray head, whose output PyTorch discards when the camera decoder is used.
+With FP16 engines of `DA3-GIANT-1.1` at 280×504 on an RTX 5090, mean relative depth error against PyTorch at the same precision (with its FP32 head) is below 0.1% and pose rotation error below 0.05°. The engine skips the auxiliary ray head, whose output PyTorch discards when the camera decoder is used.
 
 | Views | 1 | 2 | 4 | 8 | 16 | 32 |
 | --- | --- | --- | --- | --- | --- | --- |
-| TensorRT FP16, ms | 14.7 | 22.4 | 40.9 | 83.9 | 195 | 476 |
+| TensorRT FP16, ms | 11.9 | 18.9 | 35.4 | 74.2 | 173 | 433 |
 | PyTorch (BF16 autocast, as `DepthAnything3.forward`), ms | 43.0 | 59.6 | 96.6 | 187 | 402 | 935 |
 
 

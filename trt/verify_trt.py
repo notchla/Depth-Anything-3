@@ -73,6 +73,7 @@ def main(
     with_poses: bool = False,
     ref_view_strategy: RefViewStrategy = "saddle_balanced",
     num_views: int = 8,
+    half_head: bool = True,
     video: Path = Path("assets/examples/robot_unitree.mp4"),
     engine_dir: Path = Path("exports"),
     depth_tol: float = 0.02,
@@ -85,6 +86,8 @@ def main(
             DepthAnything3.inference does, and must have a matching aspect ratio.
         depth_tol: Tolerance on the mean relative depth error; focal_tol on the max relative
             focal error. Both, and rotation_tol_deg, compare TensorRT with PyTorch.
+        half_head: False verifies the engine exported with --no-half-head. PyTorch runs the head
+            in FP32 either way.
     """
     images, _, _ = InputProcessor()(read_frames(video, num_views), process_res=max(size))
     assert tuple(images.shape[-2:]) == size, (
@@ -115,7 +118,7 @@ def main(
 
     @torch.no_grad()
     def run_patched(strategy: RefViewStrategy | int) -> dict[str, torch.Tensor]:
-        outputs = DA3Export(net, precision, strategy).eval()(*inputs)
+        outputs = DA3Export(net, precision, strategy, half_head=False).eval()(*inputs)
         return dict(zip(OUTPUT_NAMES + ["reference_view"], outputs))
 
     patched = run_patched(ref_view_strategy)
@@ -123,7 +126,7 @@ def main(
         (patched[name] - reference[name]).abs().max().item() for name in OUTPUT_NAMES
     )
 
-    name = export_name(model_id, size, precision, with_poses, ref_view_strategy)
+    name = export_name(model_id, size, precision, with_poses, ref_view_strategy, half_head)
     engine_path = engine_dir / f"{name}.engine"
     # Memory cached by the PyTorch runs can leave too little for the engine's context.
     torch.cuda.empty_cache()

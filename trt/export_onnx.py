@@ -9,6 +9,7 @@ Without poses, the reference-view strategy is baked into the graph.
 """
 
 import types
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Literal
 
@@ -37,10 +38,12 @@ def export_name(
     precision: Precision,
     with_poses: bool,
     ref_view_strategy: RefViewStrategy,
+    half_head: bool = True,
 ) -> str:
     H, W = size
     variant = "poses" if with_poses else ref_view_strategy
-    return f"{model_id.split('/')[-1].lower()}_{variant}_{H}x{W}_{precision}"
+    suffix = "" if half_head else "_fp32head"
+    return f"{model_id.split('/')[-1].lower()}_{variant}_{H}x{W}_{precision}{suffix}"
 
 
 def load_model(model_id: str) -> DepthAnything3Net:
@@ -259,18 +262,21 @@ def make_exportable(net: DepthAnything3Net, size: tuple[int, int]) -> None:
 class DA3Export(nn.Module):
     """The depth and camera-decoder outputs of DepthAnything3Net.forward, under the autocast that
     DepthAnything3.forward applies, followed without poses by `reference_view`: the index of the
-    view whose camera frame the extrinsics are expressed in. Call make_exportable on `net` first."""
+    view whose camera frame the extrinsics are expressed in. Call make_exportable on `net` first.
+    With half_head, the DPT head runs under that autocast too, whereas PyTorch runs it in FP32."""
 
     def __init__(
         self,
         net: DepthAnything3Net,
         precision: Precision,
         ref_view_strategy: RefViewStrategy | int,
+        half_head: bool = True,
     ) -> None:
         super().__init__()
         self.net = net
         self.precision = precision
         self.ref_view_strategy = ref_view_strategy
+        self.half_head = half_head
 
     def forward(
         self,
@@ -290,9 +296,12 @@ class DA3Export(nn.Module):
             feats, _ = net.backbone(
                 image, cam_token=cam_token, ref_view_strategy=self.ref_view_strategy
             )
-            with torch.autocast("cuda", enabled=False):
+            with nullcontext() if self.half_head else torch.autocast("cuda", enabled=False):
                 # chunk_size=None: the default chunking is a Python loop over the views.
                 output = net.head(feats, H, W, patch_start_idx=0, chunk_size=None)
+            with torch.autocast("cuda", enabled=False):
+                for name in output:
+                    output[name] = output[name].float()
                 output = net._process_camera_estimation(feats, H, W, output)
         outputs = tuple(output[name] for name in OUTPUT_NAMES)
         if extrinsics is None:
@@ -322,6 +331,7 @@ def main(
     with_poses: bool = False,
     ref_view_strategy: RefViewStrategy = "saddle_balanced",
     max_views: int = 32,
+    half_head: bool = True,
     out_dir: Path = Path("exports"),
 ):
     """
@@ -330,12 +340,15 @@ def main(
         with_poses: Add `input_extrinsics` (w2c, 4x4) and `input_intrinsics` (3x3) inputs. The
             extrinsics must be normalized as DepthAnything3._normalize_extrinsics does.
         ref_view_strategy: Baked into the graph without poses; unused with poses.
+        half_head: Run the DPT head at `precision` rather than in FP32 like PyTorch, which is
+            about 10% faster with FP16 at 16 views. --no-half-head names the export *_fp32head.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"{export_name(model_id, size, precision, with_poses, ref_view_strategy)}.onnx"
+    name = export_name(model_id, size, precision, with_poses, ref_view_strategy, half_head)
+    path = out_dir / f"{name}.onnx"
     net = load_model(model_id)
     make_exportable(net, size)
-    model = DA3Export(net, precision, ref_view_strategy).eval()
+    model = DA3Export(net, precision, ref_view_strategy, half_head).eval()
 
     # torch.export specializes dimensions of size 0 and 1, and the reference-view selection only
     # runs from 3 views on.
