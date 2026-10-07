@@ -194,6 +194,64 @@ from depth_anything_3.cfg import create_object, load_config
 Model = create_object(load_config("path/to/new/config"))
 ```
 
+### ⚡ TensorRT
+
+[`trt/`](trt) exports any-view models (default `DA3-GIANT-1.1`) to ONNX and builds TensorRT engines that output depth and camera poses, optionally conditioned on input poses. Tested with torch 2.11 (CUDA 13.0) and TensorRT 11.3 on an RTX 5090. Engines only run on the TensorRT version that built them, so change the `tensorrt-cu13` pin in `pyproject.toml` to match your TensorRT installation if you plan to use its runtime or `trtexec`.
+
+```bash
+uv venv --python 3.12 && source .venv/bin/activate
+uv pip install torch==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu130
+uv pip install -e ".[export]" addict
+
+python trt/export_onnx.py                # no poses -> exports/da3-giant-1.1_saddle_balanced_280x504_fp16.onnx
+python trt/export_onnx.py --with-poses   # poses    -> exports/da3-giant-1.1_poses_280x504_fp16.onnx
+python trt/export_trt.py exports/da3-giant-1.1_saddle_balanced_280x504_fp16.onnx
+python trt/export_trt.py exports/da3-giant-1.1_poses_280x504_fp16.onnx
+
+python trt/verify_trt.py --num-views 8 [--with-poses]   # compare with PyTorch on frames of robot_unitree.mp4
+python trt/benchmark_trt.py exports/da3-giant-1.1_saddle_balanced_280x504_fp16.engine
+```
+
+Each script takes `--help`. Things to keep in mind:
+- The image size is static (`--size H W`, multiples of 14; 280×504 is what `process_res=504` gives for 16:9 images), so you need one engine per size. The number of views is dynamic, 1 to 32 by default with kernels tuned for 16 (`--max-views` at export, `--views min opt max` at build).
+- Poses are a separate engine (`--with-poses`), as TensorRT has no optional inputs.
+- The precision (`fp16` by default, `bf16`, `fp32`) is chosen at ONNX export, since TensorRT 11 builds strongly typed networks. Inputs and outputs are FP32 regardless.
+- Image preprocessing, extrinsics normalization and the alignment of predictions to input poses stay in Python: use `InputProcessor`, `DepthAnything3._normalize_extrinsics` and `DepthAnything3._align_to_input_extrinsics_intrinsics` as `DepthAnything3.inference` does.
+- Without poses, the reference-view strategy is baked into the engine (`--ref-view-strategy`, `saddle_balanced` by default), and the engine returns the view it chose as `reference_view`. With many views, `saddle_balanced` can rank views by score differences within floating-point rounding, so TensorRT and PyTorch may pick different reference views; `verify_trt.py` then compares with PyTorch forced to the TensorRT choice. Use `--ref-view-strategy first` for reproducible poses.
+
+| Engine | Tensor | | Shape | dtype | Format |
+| --- | --- | --- | --- | --- | --- |
+| both | `image` | in | (1, S, 3, H, W) | float32 | RGB in [0, 1], then ImageNet-normalized, as `InputProcessor` returns it. Views in any order. |
+| | `depth` | out | (1, S, H, W) | float32 | z-depth along each camera's optical axis (not distance along the ray), positive. Up to an unknown scale, in the same units as the `extrinsics` translations. |
+| | `depth_conf` | out | (1, S, H, W) | float32 | `exp(x) + 1`, so ≥ 1; higher is more confident. Relative only: threshold it by percentile, as the GLB export does. |
+| | `extrinsics` | out | (1, S, 3, 4) | float32 | `[R \| t]`, OpenCV world-to-camera (x right, y down, z forward), in input view order. |
+| | `intrinsics` | out | (1, S, 3, 3) | float32 | Pixels at the engine's H×W: predicted `fx`, `fy`; principal point fixed at (W/2, H/2); no skew. |
+| no poses | `reference_view` | out | (1,) | int64 | Index of the view whose camera frame is the world frame, so its `extrinsics` are the identity. 0 for fewer than 3 views. |
+| poses | `input_extrinsics` | in | (1, S, 4, 4) | float32 | OpenCV world-to-camera, normalized by `DepthAnything3._normalize_extrinsics` (first view at the identity, scaled by the median camera distance). |
+| | `input_intrinsics` | in | (1, S, 3, 3) | float32 | Pixels at the engine's H×W, as `InputProcessor` rescales them. |
+
+The pose engine predicts its own `extrinsics` and `intrinsics`, conditioned on the input poses but not equal to them, and `depth` is consistent with the predicted poses. To express depth in the units of your input poses, align as `DepthAnything3._align_to_input_extrinsics_intrinsics` does (Umeyama on the camera centers, then divide `depth` by the scale).
+
+```python
+import sys; sys.path.insert(0, "trt")
+from pathlib import Path
+from common import TRTEngine
+from depth_anything_3.utils.io.input_processor import InputProcessor
+
+images, _, _ = InputProcessor()(
+    ["assets/examples/SOH/000.png", "assets/examples/SOH/010.png"], process_res=504
+)  # (N, 3, 280, 504)
+engine = TRTEngine(Path("exports/da3-giant-1.1_saddle_balanced_280x504_fp16.engine"))
+out = engine(image=images[None].cuda())  # depth, depth_conf, extrinsics, intrinsics, reference_view
+```
+
+With FP16 engines of `DA3-GIANT-1.1` at 280×504 on an RTX 5090, mean relative depth error against PyTorch at the same precision is below 0.1% and pose rotation error below 0.05°. The engine skips the auxiliary ray head, whose output PyTorch discards when the camera decoder is used.
+
+| Views | 1 | 2 | 4 | 8 | 16 | 32 |
+| --- | --- | --- | --- | --- | --- | --- |
+| TensorRT FP16, ms | 14.7 | 22.4 | 40.9 | 83.9 | 195 | 476 |
+| PyTorch (BF16 autocast, as `DepthAnything3.forward`), ms | 43.0 | 59.6 | 96.6 | 187 | 402 | 935 |
+
 
 
 ## 📚 Useful Documentation
