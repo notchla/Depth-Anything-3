@@ -206,6 +206,14 @@ def _cam_enc_forward(self, ext, ixt, image_size):
     return self.trunk_norm(pose_tokens)
 
 
+# Global attention sums exp(s - max) * v over every view's tokens before normalizing, and TensorRT's
+# fused FP16 attention holds that sum in FP16: 28 views of DA3-GIANT-1.1 reach 65k at block 33.
+# Scaling v in the graph does not help, since TensorRT folds the scalar into the attention kernel
+# after the sum, so the qkv weights produce v already scaled and proj undoes it. A power of two
+# keeps the scaling exact.
+GLOBAL_V_SCALE = 16.0
+
+
 def make_exportable(net: DepthAnything3Net, size: tuple[int, int]) -> None:
     """Patch `net` in place so that torch.export can trace it at a static image size and a dynamic
     number of views. Outputs are unchanged up to floating-point reordering."""
@@ -254,6 +262,15 @@ def make_exportable(net: DepthAnything3Net, size: tuple[int, int]) -> None:
     for m in net.modules():
         if isinstance(m, SwiGLUFFNFused):
             m.forward = types.MethodType(SwiGLUFFN.forward, m)
+
+    with torch.no_grad():
+        for i, block in enumerate(vit.blocks):
+            if i >= vit.alt_start and i % 2 == 1:
+                v_rows = slice(2 * vit.embed_dim, 3 * vit.embed_dim)
+                block.attn.qkv.weight[v_rows] /= GLOBAL_V_SCALE
+                if block.attn.qkv.bias is not None:
+                    block.attn.qkv.bias[v_rows] /= GLOBAL_V_SCALE
+                block.attn.proj.weight *= GLOBAL_V_SCALE
 
     if net.cam_enc is not None:
         net.cam_enc.forward = types.MethodType(_cam_enc_forward, net.cam_enc)
